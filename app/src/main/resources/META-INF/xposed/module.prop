@@ -1,0 +1,6 @@
+# libxposed 现代模块清单（LSPosed 通过本文件识别模块与 API 版本）
+# min/target 均为 102：需要支持 API 102 的 LSPosed 版本
+minApiVersion=102
+targetApiVersion=102
+# false = 作用域可由用户在 LSPosed 中调整（scope.list 为默认推荐项）
+staticScope=false

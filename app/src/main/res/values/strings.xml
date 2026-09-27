@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">抖音不裁剪</string>
+    <string name="module_description">抖音视频按原始比例完整显示，不再左右裁剪</string>
+</resources>
