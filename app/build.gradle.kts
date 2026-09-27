@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.dunxuan.douyinnocrop"
         minSdk = 28          // 抖音最低 Android 9；LSPosed 现代模块建议 ≥27
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 1
+        versionName = "1.0"
     }
 
     buildTypes {
