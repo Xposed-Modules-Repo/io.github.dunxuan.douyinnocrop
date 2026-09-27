@@ -5,6 +5,12 @@
 A modern LSPosed module (Xposed API **102**) that makes Douyin render videos at their
 original aspect ratio — no more left/right cropping.
 
+## 效果对比
+
+![修改前 cover 填满裁左右 · 修改后 内接适配零裁剪](assets/before-after.svg)
+
+*左：抖音原生 cover 放大填满 → 视频比屏幕宽时左右被裁；右：本模块把渲染 View 收成视频宽高比的内接矩形 → 完整显示，多余部分留背景。*
+
 ## 原理 / How it works
 
 抖音播放引擎按 cover（放大填满）模式把视频渲染进与容器同尺寸的 surface，当视频比容器
