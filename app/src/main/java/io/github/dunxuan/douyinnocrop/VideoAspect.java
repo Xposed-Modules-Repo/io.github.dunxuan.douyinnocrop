@@ -48,28 +48,7 @@ final class VideoAspect {
         return 0f;
     }
 
-    /** 该 Aweme 是否为图文/动图帖子（imageInfos 或 images 非空）。 */
-    static boolean isImagePost(Object aweme) {
-        if (aweme == null) {
-            return false;
-        }
-        try {
-            Object infos = aweme.getClass().getField("imageInfos").get(aweme);
-            if (infos instanceof List && !((List<?>) infos).isEmpty()) {
-                return true;
-            }
-        } catch (Throwable ignored) {
-            // 字段不可达，继续试 images
-        }
-        try {
-            Object imgs = aweme.getClass().getField("images").get(aweme);
-            return imgs instanceof List && !((List<?>) imgs).isEmpty();
-        } catch (Throwable ignored) {
-            return false;
-        }
-    }
-
-    /** 该 Aweme 的帖子 id（用于识别 View 复用到了新内容，防止真实尺寸残留）。 */
+    /** 该 Aweme 的帖子 id（用于日志与 View 复用识别）。 */
     static String aid(Object aweme) {
         if (aweme == null) {
             return null;
@@ -102,8 +81,19 @@ final class VideoAspect {
 
     /** 图文/动图回退：Aweme.imageInfos 第一项的 width/height（ImageInfo 为语义字段名）。 */
     private static float fromImageInfos(Object aweme) {
+        // 1) imageInfos（ImageInfo.width/height）
+        float r = listDims(aweme, "imageInfos");
+        if (isSane(r)) {
+            return r;
+        }
+        // 2) images（有的帖只填 images 不填 imageInfos——aspect=0 的来源）
+        return listDims(aweme, "images");
+    }
+
+    /** 读 aweme.<listField> 第一项的 width/height；读不到返回 0。 */
+    private static float listDims(Object aweme, String listField) {
         try {
-            Object infos = aweme.getClass().getField("imageInfos").get(aweme);
+            Object infos = aweme.getClass().getField(listField).get(aweme);
             if (!(infos instanceof List)) {
                 return 0f;
             }

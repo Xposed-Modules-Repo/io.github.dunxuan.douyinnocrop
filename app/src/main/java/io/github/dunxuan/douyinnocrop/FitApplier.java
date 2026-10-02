@@ -7,75 +7,51 @@ import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
-import android.widget.ImageView;
 
 import java.lang.ref.WeakReference;
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Locale;
 import java.util.Map;
 import java.util.WeakHashMap;
 
 /**
- * 全屏内容适配器——"只处理全屏界面"的落地点。
+ * 视频全屏适配器——把视频/动图渲染 SurfaceView 收缩为"内容比例的最大内接矩形"，
+ * 使 surface 比例 == 内容比例：SurfaceView 原生按比例缩放缓冲区，cover 等价于 fit，
+ * 消除裁剪。这是本模块唯一生效机制（经日志验证：绑定时写 LP + 容器 layout 监听
+ * 抗抖音 FeedAllScreenHelper/FeedLandscapeEntranceV2 的覆写）。
  *
- * 两类内容、两条路径：
- *   1) 视频/动图（TextureView）：收缩 LayoutParams 为"宽高比最大内接矩形"，
- *      使 surface 比例 == 内容比例，cover 渲染等价于 fit，消除裁剪；
- *   2) 静态图文（Fresco DraweeView）：不改尺寸，改层级 scaleType 为 FIT_CENTER，
- *      由 Fresco 自己完成 letterbox——不破坏捏合缩放，多图切换自动正确。
- *
- * 门控（三层，"只处理点名的全屏界面"）：
- *   0) 评论区一律不碰：
- *      a) 视图树/Activity/params.Fragment 类名含 comment；
- *      b) 当前位于某个可见评论 Fragment 的视图子树内
- *         （CommentFeedDialogFragment → CommentFeedFragment，覆盖 params
- *          判据的时序竞态——绑定瞬间 commentFragment 可能尚未回填）；
- *      c) 位于全屏级的独立窗口（评论面板是 Dialog，decor 与 Activity 不同）；
- *   1) 场所白名单：主 Feed（*MainActivity）、详情播放器（*DetailActivity）、
- *      清屏全屏（cleanActive）——搜索列表/广告/未知上下文全部还原；
- *   2) 图片类内容在详情图文浏览态（面板可见或详情非清屏）不触碰；
- *   3) 容器必须全屏级（宽 ≥ 窗口 85% 且高 ≥ 窗口 40%）；
+ * 门控（只处理用户点名的全屏界面）：
+ *   1) 评论区一律不碰（视图树/Activity/params Fragment/可见评论 Fragment 子树/
+ *      全屏级独立窗口 五重判据）；
+ *   2) 场所白名单：主 Feed（*MainActivity）、详情播放器（*DetailActivity）、
+ *      清屏（cleanActive）——搜索列表/广告/未知上下文还原；
+ *   3) 直播上下文不碰；
+ *   4) 容器必须全屏级（宽 ≥ 窗口 85% 且高 ≥ 窗口 30%）；
  *   容器尺寸变化时（进/出全屏、面板开合）通过持久 layout 监听自动重算/还原。
  *
- * 状态按 View 记账（FitState 弱表），attach 补偿只用该 View 自己的状态；
- * 原始尺寸/原始 scaleType 均记录于弱表，还原时先比对是否仍是我们写入的值。
- * 全部操作保证在主线程执行。
+ * 状态按 View 记账（FitState 弱表）；原始尺寸记账于弱表，还原时先比对
+ * 是否仍是我们写入的值。全部操作保证在主线程执行。
  */
 final class FitApplier {
 
     private static final String TAG = "DouYinNoCrop";
 
-    /** 某条内容/某个 View 的收缩状态。 */
+    /** 某条内容绑定到某个渲染 View 的收缩状态。 */
     static final class FitState {
         final float aspect;
-        final boolean imagePost;
-        /** true = 静态图文 DraweeView，走 scaleType 适配而非 LayoutParams。 */
-        final boolean draweeFit;
-        /** 内容 aid（帖子 id）：用于识别 View 复用到了新内容，防止真实尺寸残留。 */
+        /** 内容 aid（帖子 id）：日志与 View 复用识别。 */
         final String aid;
-        /** 绑定时的播放器对象（BaseFeedPlayerView，非 View）：attach 补偿时验证
+        final WeakReference<Object> params;
+        /** 绑定时的播放器对象（BaseFeedPlayerView）：attach 补偿时验证
          *  "这个 View 确实是该播放器的渲染 View"，防止评论区等无关 TextureView
          *  误吃 pending（评论区 holder 不用 VideoItemParams，判据全会落空）。 */
         final WeakReference<Object> player;
-        final WeakReference<Object> params;
 
-        FitState(float aspect, boolean imagePost, Object params) {
-            this(aspect, imagePost, params, false, null, null);
-        }
-
-        FitState(float aspect, boolean imagePost, Object params, boolean draweeFit, String aid) {
-            this(aspect, imagePost, params, draweeFit, aid, null);
-        }
-
-        FitState(float aspect, boolean imagePost, Object params, boolean draweeFit,
-                 String aid, Object player) {
+        FitState(float aspect, String aid, Object params, Object player) {
             this.aspect = aspect;
-            this.imagePost = imagePost;
-            this.draweeFit = draweeFit;
             this.aid = aid;
-            this.player = (player != null) ? new WeakReference<>(player) : null;
             this.params = (params != null) ? new WeakReference<>(params) : null;
+            this.player = (player != null) ? new WeakReference<>(player) : null;
         }
     }
 
@@ -85,38 +61,14 @@ final class FitApplier {
     /** video → {原始宽, 原始高, 本模块写入的宽, 本模块写入的高}；仅主线程。 */
     private static final Map<View, int[]> ORIGINALS = new WeakHashMap<>();
 
-    /** DraweeView → {原始 ImageView scaleType, 原始 hierarchy scaleType}；仅主线程。 */
-    private static final Map<View, Object[]> SCALE_ORIGS = new WeakHashMap<>();
-
     /** video → 当前挂载的容器尺寸监听；容器变化时换挂。仅主线程。 */
     private static final Map<View, Watch> WATCHES = new WeakHashMap<>();
 
-    /**
-     * video → 播放器回调的真实宽高比（VideoPatchLayout.onVideoSizeChanged）。
-     * 优先于 FitState.aspect——Aweme 字段可能是封面/海报尺寸，
-     * 动图多图时 imageInfos[0] 也可能与当前显示的图不符，真实回调是唯一权威值。
-     * 配套 REAL_AID：仅当真实尺寸属于当前绑定的同一内容（aid 相同）时才采用，
-     * View 复用到新内容后旧真实尺寸自动失效（新内容播放必然重新回调）。
-     */
-    private static final Map<View, Float> REAL = new WeakHashMap<>();
+    /** video → 最近一次 skip 原因；同一原因只打一条，避免 getAweme 高频轮询刷屏。 */
+    private static final Map<View, String> SKIP_LOGGED = new WeakHashMap<>();
 
-    /** video → REAL 尺寸所属内容的 aid（与 FitState.aid 比对）。 */
-    private static final Map<View, String> REAL_AID = new WeakHashMap<>();
-
-    /**
-     * 最近一次成功读到比例、但渲染 View 尚未创建时的状态（仅 TextureView 路径）。
-     * DraweeView 路径不写 pending，防止图片状态污染视频 attach 补偿。
-     */
-    private static volatile FitState pending;
-
-    /** VideoItemParams.isDetailPagePanelShow 的缓存 Field（语义字段名，稳定）。 */
-    private static volatile Field panelField;
-
-    /** Fresco ScalingUtils.ScaleType 类（启动时按包 ClassLoader 解析）。 */
-    private static volatile Class<?> scaleTypeCls;
-    /** ScalingUtils.ScaleType.FIT_CENTER 枚举常量缓存。 */
-    private static volatile Object fitCenterConst;
-    private static volatile boolean scaleReflectLogged;
+    /** video → 已打过 apply 日志的内容 key（aid|比例），换内容才再打。 */
+    private static final Map<View, String> APPLY_LOGGED = new WeakHashMap<>();
 
     /**
      * 各 CleanModeViewModel 实例的清屏状态（vm → 是否清屏中）。
@@ -125,17 +77,10 @@ final class FitApplier {
      */
     private static final Map<Object, Boolean> CLEAN_VMS = new WeakHashMap<>();
 
-    private FitApplier() {
-    }
+    /** 绑定成功但渲染 View 尚未创建时的状态（attach 补偿消费）。 */
+    private static volatile FitState pending;
 
-    /** 包加载时调用：解析 Fresco 反射所需类。失败仅影响 DraweeView 路径。 */
-    static void init(ClassLoader loader) {
-        try {
-            scaleTypeCls = Class.forName(
-                    "com.facebook.drawee.drawable.ScalingUtils$ScaleType", false, loader);
-        } catch (Throwable t) {
-            log("Fresco ScaleType class not found: " + t);
-        }
+    private FitApplier() {
     }
 
     /** sA 状态机执行完毕后回写该 ViewModel 的清屏状态（来源列表 a 是否为空）。 */
@@ -161,17 +106,22 @@ final class FitApplier {
 
     // ---------------------------------------------------------------- 入口
 
-    /** 内容绑定/图片 holder 绑定时调用：记录状态并适配当前 View。 */
+    /** 内容绑定（VideoItemParams.getAweme）时调用：记录状态并适配当前 View。 */
     static void apply(final View video, final FitState state) {
-        if (state == null) {
+        if (state == null || state.aspect <= 0.05f) {
             return;
         }
-        if (!state.draweeFit && state.aspect <= 0.05f) {
-            return;
+        if (video != null) {
+            String key = state.aid + "|" + Math.round(state.aspect * 1000f);
+            String prev = APPLY_LOGGED.get(video);
+            if (!key.equals(prev)) {
+                APPLY_LOGGED.put(video, key);
+                Log.d(TAG, "apply view=" + video.getClass().getName()
+                        + " aid=" + state.aid
+                        + " aspect=" + state.aspect);
+            }
         }
-        if (!state.draweeFit) {
-            pending = state; // 仅视频/动图状态参与 attach 补偿
-        }
+        pending = state;
         if (video == null) {
             return; // View 还没创建，attach 补偿接手
         }
@@ -203,7 +153,7 @@ final class FitApplier {
                         return;
                     }
                 }
-                if (state == null || state.draweeFit || state.aspect <= 0.05f) {
+                if (state == null || state.aspect <= 0.05f) {
                     return; // 没有可信的视频状态：宁可不收缩，也不套错误比例
                 }
                 applyMain(video, state);
@@ -262,92 +212,10 @@ final class FitApplier {
             @Override
             public void run() {
                 STATES.remove(video);
-                REAL.remove(video);
-                REAL_AID.remove(video);
                 unwatch(video);
                 undo(video);
             }
         });
-    }
-
-    /**
-     * 播放器真实尺寸回调（VideoPatchLayout.onVideoSizeChanged）。
-     * 这是宽高比的唯一权威来源：Aweme 字段可能是封面尺寸、
-     * 多图帖的 imageInfos[0] 也可能与当前显示的图不符——
-     * 此前图文界面动图"变窄比例错误"正是错误比例被写进绝对像素所致。
-     * 从播放器 View 子树中找到被跟踪的渲染 View，按其 aid 覆盖比例并立即重算。
-     */
-    static void onPlayerLayoutSize(final View root, final int width, final int height) {
-        if (root == null || width <= 0 || height <= 0) {
-            return;
-        }
-        final float aspect = (float) width / (float) height;
-        if (aspect < 0.1f || aspect > 20f) {
-            return;
-        }
-        runOnMain(root, new Runnable() {
-            @Override
-            public void run() {
-                View target = findTracked(root);
-                if (target == null) {
-                    Log.d(TAG, "player size " + width + "x" + height
-                            + " but no tracked view in subtree");
-                    return;
-                }
-                FitState state = STATES.get(target);
-                if (state == null) {
-                    return;
-                }
-                REAL.put(target, aspect);
-                REAL_AID.put(target, state.aid);
-                FitState fresh = new FitState(aspect, state.imagePost,
-                        state.params != null ? state.params.get() : null,
-                        state.draweeFit, state.aid);
-                STATES.put(target, fresh);
-                View container = parentOf(target);
-                if (container != null) {
-                    watch(target, container);
-                    fit(target, container, fresh);
-                }
-                Log.d(TAG, "real size " + width + "x" + height
-                        + " overrides aspect=" + aspect);
-            }
-        });
-    }
-
-    /** BFS 在 root 子树里找第一个被 STATES 跟踪的 View（限深防意外）。 */
-    private static View findTracked(View root) {
-        java.util.ArrayDeque<View> queue = new java.util.ArrayDeque<>();
-        queue.add(root);
-        int budget = 500; // 节点预算，防极端布局拖慢主线程
-        while (!queue.isEmpty() && budget-- > 0) {
-            View v = queue.poll();
-            if (STATES.containsKey(v)) {
-                return v;
-            }
-            if (v instanceof ViewGroup) {
-                ViewGroup vg = (ViewGroup) v;
-                for (int i = 0; i < vg.getChildCount(); i++) {
-                    queue.add(vg.getChildAt(i));
-                }
-            }
-        }
-        return null;
-    }
-
-    /** 该 View 当前可用的权威比例：真实回调值（aid 匹配时）优先，否则用绑定时的猜测值。 */
-    private static float effectiveAspect(View video, FitState state) {
-        Float real = REAL.get(video);
-        if (real != null && real > 0.05f) {
-            String realAid = REAL_AID.get(video);
-            if (state.aid == null || state.aid.equals(realAid)) {
-                return real;
-            }
-            // REAL 属于上一条内容 → 作废，防止 View 复用后比例残留
-            REAL.remove(video);
-            REAL_AID.remove(video);
-        }
-        return state.aspect;
     }
 
     // ------------------------------------------------------------ 内部实现
@@ -361,14 +229,8 @@ final class FitApplier {
         }
     }
 
-    /** 主线程上的适配主流程（视频与图文共用：记状态 + 挂监听 + 执行适配）。 */
+    /** 主线程上的适配主流程：记状态 + 挂监听 + 执行适配。 */
     private static void applyMain(View video, FitState state) {
-        // View 复用到新内容：旧的真实尺寸作废（新内容播放会重新回调）
-        String realAid = REAL_AID.get(video);
-        if (realAid != null && state.aid != null && !realAid.equals(state.aid)) {
-            REAL.remove(video);
-            REAL_AID.remove(video);
-        }
         STATES.put(video, state);
         View container = parentOf(video);
         if (container == null) {
@@ -391,54 +253,51 @@ final class FitApplier {
             return; // 监听已挂上，容器首次布局后会回调
         }
 
-        // 门控零：评论区一律不碰（评论动图/评论图片查看器/评论 feed，无论容器多像全屏）。
-        if (isCommentContext(video, state)) {
+        // 门控一：评论区一律不碰（评论动图/评论图片查看器/评论 feed，无论容器多像全屏）。
+        String commentJudge = commentJudge(video, state);
+        if (commentJudge != null) {
             undo(video);
-            Log.d(TAG, "skip comment context");
+            logSkip(video, commentJudge);
             return;
         }
-        // 门控一：场所白名单——只处理用户点名的三处：
+        // 门控二：场所白名单——只处理用户点名的三处：
         //   主 Feed（MainActivity 家族）、详情全屏播放器（*DetailActivity 家族）、清屏全屏（cleanActive）。
         //   搜索列表、广告页、商城等其余界面一律还原、保持抖音原生行为。
         if (!inAllowedScope(video)) {
             undo(video);
-            Log.d(TAG, "skip out-of-scope context");
+            logSkip(video, "out-of-scope context");
             return;
         }
-        // 门控二（图片类内容专用，双保险）：
-        //   a) 详情图文浏览面板可见（isDetailPagePanelShow）→ 绝不触碰；
-        //   b) 位于 Detail 类 Activity 且当前非清屏 → 同样视为浏览态，跳过。
-        // 主 Feed（MainActivity）与清屏全屏（cleanActive）放行 —— "只处理全屏界面"。
-        if (state.imagePost) {
-            if (panelShown(state)) {
-                undo(video);
-                Log.d(TAG, "skip detail image browse (panel shown)");
-                return;
-            }
-            if (isDetailActivity(video) && !cleanActive()) {
-                undo(video);
-                Log.d(TAG, "skip detail activity (not clean mode)");
-                return;
-            }
+        // 门控三：直播上下文不在范围内（直播封面/直播间组件一律还原）。
+        if (isLiveContext(video)) {
+            undo(video);
+            logSkip(video, "live context");
+            return;
         }
-        // 门控三：非全屏容器（搜索卡片等）保持抖音原生 cover 填充
+        // 门控四：非全屏容器（搜索卡片等）保持抖音原生 cover 填充
         if (!isFullscreenLevel(container, cw, ch)) {
             undo(video);
-            Log.d(TAG, "skip non-fullscreen container " + cw + "x" + ch);
+            logSkip(video, "non-fullscreen container " + cw + "x" + ch);
             return;
         }
+        SKIP_LOGGED.remove(video); // 本次放行：清掉历史 skip 记录，下次跳过会重新打印
 
-        if (state.draweeFit) {
-            applyScaleType(video);
-            return;
-        }
         fitLayoutParams(video, cw, ch, state);
     }
 
-    // ------------------------------------------- 路径一：TextureView 收缩
+    private static void logSkip(View video, String reason) {
+        String prev = SKIP_LOGGED.get(video);
+        if (reason.equals(prev)) {
+            return;
+        }
+        SKIP_LOGGED.put(video, reason);
+        Log.d(TAG, "skip " + reason + " (view=" + video.getClass().getName() + ")");
+    }
+
+    // ---------------------------------------------------- LayoutParams 收缩
 
     private static void fitLayoutParams(View video, int cw, int ch, FitState state) {
-        float aspect = effectiveAspect(video, state);
+        float aspect = state.aspect;
         int targetW;
         int targetH;
         if (aspect >= (float) cw / (float) ch) {
@@ -462,98 +321,16 @@ final class FitApplier {
         video.setLayoutParams(lp);
         markWritten(video, targetW, targetH);
         Log.d(TAG, "fit " + cw + "x" + ch + " -> "
-                + targetW + "x" + targetH + " (aspect=" + aspect + ")");
-    }
-
-    // ----------------------------------- 路径二：DraweeView scaleType 适配
-
-    /**
-     * 把静态图文的显示方式改为 FIT（层级 scaleType → FIT_CENTER）。
-     * 不改 LayoutParams：捏合缩放、多图切换、容器变形全部不受影响，
-     * 还原时恢复原始 scaleType 即可。反射失败仅记日志，不影响视频路径。
-     */
-    private static void applyScaleType(View video) {
-        if (!(video instanceof ImageView)) {
-            return;
-        }
-        try {
-            Class<?> stCls = scaleTypeCls;
-            if (stCls == null) {
-                return;
-            }
-            Object fitCenter = fitCenterConst;
-            if (fitCenter == null) {
-                fitCenter = stCls.getField("FIT_CENTER").get(null);
-                fitCenterConst = fitCenter;
-            }
-            Object holder = video.getClass().getField("mDraweeHolder").get(video);
-            Object hierarchy = holder.getClass().getMethod("getHierarchy").invoke(holder);
-            Method getScale = hierarchy.getClass().getMethod("getActualImageScaleType");
-            Method setScale = hierarchy.getClass().getMethod("setActualImageScaleType", stCls);
-            Object cur = getScale.invoke(hierarchy);
-
-            ImageView iv = (ImageView) video;
-            if (!SCALE_ORIGS.containsKey(video)) {
-                SCALE_ORIGS.put(video, new Object[]{iv.getScaleType(), cur});
-            }
-            boolean changed = false;
-            if (iv.getScaleType() == ImageView.ScaleType.CENTER_CROP) {
-                iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                changed = true;
-            }
-            if (cur == null || !fitCenter.equals(cur)) {
-                setScale.invoke(hierarchy, fitCenter);
-                changed = true;
-            }
-            if (changed) {
-                Log.d(TAG, "scale-fit DraweeView -> FIT_CENTER");
-            }
-        } catch (Throwable t) {
-            logOnce("scale-fit reflection failed: " + t);
-        }
-    }
-
-    /** 还原 DraweeView 的原始 scaleType（仅当当前值仍是我们写入的值才覆盖）。 */
-    private static void restoreScale(View video) {
-        Object[] orig = SCALE_ORIGS.remove(video);
-        if (orig == null || !(video instanceof ImageView)) {
-            return;
-        }
-        try {
-            ImageView iv = (ImageView) video;
-            Class<?> stCls = scaleTypeCls;
-            if (stCls == null) {
-                return;
-            }
-            Object holder = video.getClass().getField("mDraweeHolder").get(video);
-            Object hierarchy = holder.getClass().getMethod("getHierarchy").invoke(holder);
-            Method getScale = hierarchy.getClass().getMethod("getActualImageScaleType");
-            Method setScale = hierarchy.getClass().getMethod("setActualImageScaleType", stCls);
-            Object cur = getScale.invoke(hierarchy);
-            Object fitCenter = fitCenterConst;
-            // 层级：当前仍是 FIT_CENTER（我们写的）且原值不同 → 恢复
-            if (orig[1] != null && fitCenter != null && fitCenter.equals(cur)
-                    && !fitCenter.equals(orig[1])) {
-                setScale.invoke(hierarchy, orig[1]);
-            }
-            // ImageView：当前仍是 FIT_CENTER 且原值是 CENTER_CROP → 恢复
-            if (orig[0] instanceof ImageView.ScaleType
-                    && iv.getScaleType() == ImageView.ScaleType.FIT_CENTER
-                    && orig[0] == ImageView.ScaleType.CENTER_CROP) {
-                iv.setScaleType((ImageView.ScaleType) orig[0]);
-            }
-            Log.d(TAG, "restore DraweeView scaleType");
-        } catch (Throwable t) {
-            logOnce("scale restore reflection failed: " + t);
-        }
+                + targetW + "x" + targetH + " (aspect=" + aspect
+                + ",aid=" + state.aid
+                + ",view=" + video.getClass().getName() + ")");
     }
 
     // ---------------------------------------------------------- 门控与还原
 
     /**
      * 容器是否为"全屏级"（主 Feed / 沉浸式播放页那样的整屏容器）。
-     * 阈值：宽 ≥ 窗口 85%（排除双列/单列卡片）且高 ≥ 窗口 40%
-     * （排除通栏 16:9 预览，保留评论面板打开时的半屏 Feed 容器）。
+     * 阈值：宽 ≥ 窗口 85%（排除双列/单列卡片）且高 ≥ 窗口 30%（排除通栏 16:9 预览）。
      * 独立小窗（后台播放）窗口本身就是小窗尺寸，容器≈窗口，判断自然通过。
      */
     private static boolean isFullscreenLevel(View container, int cw, int ch) {
@@ -563,52 +340,29 @@ final class FitApplier {
         if (rw <= 0 || rh <= 0) {
             return true; // 窗口还没测量出来：按全屏处理，避免主 Feed 因时序漏适配
         }
-        return cw >= rw * 0.85f && ch >= rh * 0.40f;
-    }
-
-    /** 该状态对应的详情页面板是否可见（仅图片类内容关心）。读不到视为不可见。 */
-    private static boolean panelShown(FitState state) {
-        if (state.params == null) {
-            return false;
-        }
-        Object params = state.params.get();
-        if (params == null) {
-            // 弱引用已清：持有者已销毁，无法证明不在浏览态 → 保守按浏览态处理
-            return true;
-        }
-        try {
-            Field f = panelField;
-            if (f == null) {
-                f = params.getClass().getField("isDetailPagePanelShow");
-                panelField = f;
-            }
-            return f.getBoolean(params);
-        } catch (Throwable t) {
-            return false;
-        }
+        return cw >= rw * 0.85f && ch >= rh * 0.30f;
     }
 
     /**
-     * 是否处于评论上下文：评论区动图/评论图片查看器/评论 feed。
-     * 判据（任一命中即算评论）：
-     *   1) 视图树：从渲染 View 向上任一祖先类名含 comment/cmt
-     *      （评论面板容器、评论 feed 根布局）；
-     *   2) 宿主 Activity 类名含 comment（CommentFeedActivity 等）；
+     * 命中的评论判据（null = 不在评论上下文）。返回值直接作为 skip 日志原因，
+     * 便于运行时精确定位是哪条判据命中：
+     *   1) 视图树：从渲染 View 向上任一祖先类名含 comment/cmt；
+     *   2) 宿主 Activity 类名含 comment；
      *   3) params 的 fragment/commentFragment/feedItemFragment 指向评论类
+     *      （Fragment 必须 isAdded——评论面板关闭后残留引用会永久误伤）
      *      或 commentFeedPageId 非空；
-     *   4) 该 View 位于某个**可见评论 Fragment 的视图子树**内
-     *      （遍历 Activity 的 FragmentManager 含子级；覆盖判据 3 的时序竞态：
-     *      getAweme 绑定瞬间 commentFragment 可能还没被 syncBind 回填）；
-     *   5) 该 View 处于全屏级的**独立窗口**（评论面板是 DialogFragment，
-     *      decorView ≠ Activity decor；长按预览等覆盖式弹窗一并排除，
-     *      后台小窗等小窗口不满足全屏级、不受此判据影响）。
+     *   4) 该 View 位于某个已添加、可见的评论 Fragment 的视图子树内
+     *      （覆盖判据 3 的时序竞态：绑定瞬间 commentFragment 可能尚未回填）；
+     *   5) 全屏级独立窗口（评论面板是 Dialog，decor ≠ Activity decor；
+     *      必须已 attach——未 attach 时 getRootView 是脱离窗口的子树顶会误判）。
      * 评论区一律不触碰（用户明确要求）。
      */
-    private static boolean isCommentContext(View video, FitState state) {
-        // 判据 1：视图树（从渲染 View 向上走，评论容器类名通常带 comment/cmt）
+    private static String commentJudge(View video, FitState state) {
+        // 判据 1：视图树
         for (View v = video; v != null; ) {
-            if (looksComment(v.getClass().getName())) {
-                return true;
+            String cls = v.getClass().getName();
+            if (looksComment(cls)) {
+                return "comment:viewtree:" + cls;
             }
             ViewParent p = v.getParent();
             v = (p instanceof View) ? (View) p : null;
@@ -616,7 +370,7 @@ final class FitApplier {
         // 判据 2：宿主 Activity
         Activity act = activityOf(video);
         if (act != null && looksComment(act.getClass().getName())) {
-            return true;
+            return "comment:activity:" + act.getClass().getName();
         }
         // 判据 3：params 上的 Fragment / pageId 字段
         Object params = (state.params != null) ? state.params.get() : null;
@@ -625,8 +379,9 @@ final class FitApplier {
             for (String fn : fragFields) {
                 try {
                     Object frag = params.getClass().getField(fn).get(params);
-                    if (frag != null && looksComment(frag.getClass().getName())) {
-                        return true;
+                    if (frag != null && looksComment(frag.getClass().getName())
+                            && isFragmentAdded(frag)) {
+                        return "comment:params." + fn + ":" + frag.getClass().getName();
                     }
                 } catch (Throwable ignored) {
                     // 字段不存在或不可访问，试下一个
@@ -635,18 +390,61 @@ final class FitApplier {
             try {
                 Object pageId = params.getClass().getField("commentFeedPageId").get(params);
                 if (pageId instanceof String && !((String) pageId).isEmpty()) {
-                    return true;
+                    return "comment:params.commentFeedPageId";
                 }
             } catch (Throwable ignored) {
                 // 字段不可达
             }
         }
         // 判据 4：可见评论 Fragment 的视图包含该 View（时序竞态兜底）
-        if (insideVisibleCommentFragment(video, act)) {
-            return true;
+        String fragHit = insideVisibleCommentFragment(video, act);
+        if (fragHit != null) {
+            return "comment:fragment-subtree:" + fragHit;
         }
         // 判据 5：全屏级独立窗口（评论 Dialog 等覆盖式弹窗）
         return inForeignFullscreenWindow(video, act);
+    }
+
+    /**
+     * video 是否位于一个全屏级、但不属于宿主 Activity 的独立窗口。
+     * 关键前提：View 必须已 attach 到窗口——未 attach 时 getRootView() 返回的是
+     * 脱离窗口的子树顶（播放器预挂载/重挂载中的 SurfaceView），必然 ≠ decor，
+     * 会被误判成独立窗口，导致主 Feed 视频被错误还原。
+     */
+    private static String inForeignFullscreenWindow(View video, Activity act) {
+        if (act == null || act.getWindow() == null) {
+            return null;
+        }
+        if (!video.isAttachedToWindow()) {
+            return null; // 未挂窗口：预布局子树，不算独立窗口
+        }
+        View decor = act.getWindow().getDecorView();
+        View root = video.getRootView();
+        if (decor == null || root == null || root == decor) {
+            return null; // 同一窗口（主 Feed / 详情 / 清屏都在 Activity 自己的窗口）
+        }
+        int dw = decor.getWidth();
+        int dh = decor.getHeight();
+        int rw = root.getWidth();
+        int rh = root.getHeight();
+        if (dw <= 0 || dh <= 0 || rw <= 0 || rh <= 0) {
+            return null; // 窗口尚未测量：交由后续 layout 重算
+        }
+        if (rw < dw * 0.85f || rh < dh * 0.50f) {
+            return null; // 非全屏级（后台小窗等）
+        }
+        return "comment:foreign-fullscreen-window"
+                + " act=" + act.getClass().getName()
+                + " root=" + root.getClass().getName();
+    }
+
+    /** Fragment.isAdded()（反射；拿不到按未添加处理，避免残留引用误伤）。 */
+    private static boolean isFragmentAdded(Object frag) {
+        try {
+            return (Boolean) frag.getClass().getMethod("isAdded").invoke(frag);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /** 类名是否像评论相关（comment 包/类，或 Cmt* 缩写）。 */
@@ -657,13 +455,12 @@ final class FitApplier {
 
     /**
      * video 是否位于某个已添加、可见、类名含 comment/cmt 的 Fragment 的视图子树内。
-     * 覆盖 CommentFeedDialogFragment（Dialog 窗口）内嵌 CommentFeedFragment 的场景：
-     * 绑定瞬间 params.commentFragment 尚未回填时，判据 3 落空，靠这里兜住。
-     * FragmentManager 反射拿不到时保守返回 false（其余判据继续）。
+     * 覆盖 CommentFeedDialogFragment（Dialog 窗口）内嵌 CommentFeedFragment 的场景。
+     * 返回命中的 Fragment 类名（null = 未命中）；反射拿不到时保守视为未命中。
      */
-    private static boolean insideVisibleCommentFragment(View video, Activity act) {
+    private static String insideVisibleCommentFragment(View video, Activity act) {
         if (act == null) {
-            return false;
+            return null;
         }
         java.util.List<Object> frags = new java.util.ArrayList<>(8);
         collectFragments(act, frags);
@@ -675,10 +472,8 @@ final class FitApplier {
                 if (!((Boolean) frag.getClass().getMethod("isAdded").invoke(frag))) {
                     continue;
                 }
-                Method hidden = null;
                 try {
-                    hidden = frag.getClass().getMethod("isHidden");
-                    if ((Boolean) hidden.invoke(frag)) {
+                    if ((Boolean) frag.getClass().getMethod("isHidden").invoke(frag)) {
                         continue;
                     }
                 } catch (Throwable ignored) {
@@ -694,7 +489,7 @@ final class FitApplier {
                 }
                 for (View v = video; v != null; ) {
                     if (v == fragView) {
-                        return true;
+                        return frag.getClass().getName();
                     }
                     ViewParent p = v.getParent();
                     v = (p instanceof View) ? (View) p : null;
@@ -703,7 +498,7 @@ final class FitApplier {
                 // 该 Fragment 反射失败，试下一个
             }
         }
-        return false;
+        return null;
     }
 
     /** 收集 Activity 顶层 Fragment 及其各一层子 Fragment（评论面板两层结构够用）。 */
@@ -746,34 +541,9 @@ final class FitApplier {
     }
 
     /**
-     * video 是否位于一个全屏级、但不属于宿主 Activity 的独立窗口
-     * （评论面板 CommentFeedDialogFragment 是 Dialog，decorView 与 Activity 不同）。
-     * 后台小窗等非全屏独立窗口不算（尺寸门控与白名单已覆盖它们）。
-     * 窗口尚未测量（宽高为 0）时无法判定，返回 false 交由后续 layout 重算。
-     */
-    private static boolean inForeignFullscreenWindow(View video, Activity act) {
-        if (act == null || act.getWindow() == null) {
-            return false;
-        }
-        View decor = act.getWindow().getDecorView();
-        View root = video.getRootView();
-        if (decor == null || root == null || root == decor) {
-            return false; // 同一窗口（主 Feed / 详情 / 清屏都在 Activity 自己的窗口）
-        }
-        int dw = decor.getWidth();
-        int dh = decor.getHeight();
-        int rw = root.getWidth();
-        int rh = root.getHeight();
-        if (dw <= 0 || dh <= 0 || rw <= 0 || rh <= 0) {
-            return false;
-        }
-        return rw >= dw * 0.85f && rh >= dh * 0.50f;
-    }
-
-    /**
      * 场所白名单——只处理用户点名的三类全屏界面：
-     *   1) 主 Feed：MainActivity 家族（MainActivity/TeenMainActivity/BasicFuncMainActivity）
-     *   2) 详情全屏播放器：*DetailActivity 家族（UltraDetail/Detail/SingleTaskDetail/LongVideoDetail…）
+     *   1) 主 Feed：MainActivity 家族
+     *   2) 详情全屏播放器：*DetailActivity 家族
      *   3) 清屏全屏：cleanActive（可发生在上述任一界面内）
      * 其余（搜索列表、广告、商城、未知 Activity、非 Activity 上下文）一律不碰。
      */
@@ -789,6 +559,24 @@ final class FitApplier {
         return n.contains("mainactivity") || n.contains("detailactivity");
     }
 
+    /**
+     * 该 View 是否处于直播上下文（直播预览卡、直播间组件）。
+     * 判据：祖先链类名含 livesdk / livepreview / android.live / live.core
+     * （避开 "deliver" 之类误伤）。
+     */
+    private static boolean isLiveContext(View video) {
+        for (View v = video; v != null; ) {
+            String n = v.getClass().getName().toLowerCase(Locale.ROOT);
+            if (n.contains("livesdk") || n.contains("livepreview")
+                    || n.contains("android.live") || n.contains("live.core")) {
+                return true;
+            }
+            ViewParent p = v.getParent();
+            v = (p instanceof View) ? (View) p : null;
+        }
+        return false;
+    }
+
     /** View 当前挂在哪个 Activity 上（解包 ContextWrapper）。解不到返回 null。 */
     private static Activity activityOf(View video) {
         Context ctx = video.getContext();
@@ -802,21 +590,8 @@ final class FitApplier {
     }
 
     /**
-     * 是否位于详情类 Activity（DetailActivity / UltraDetailActivity 等）。
-     * 详情页 = 图文浏览与清屏全屏的发生地；主 Feed 在 MainActivity，不匹配。
-     * 类名含 "DetailActivity" 子串判定（UltraDetailActivity 亦命中）。
-     */
-    private static boolean isDetailActivity(View video) {
-        Activity act = activityOf(video);
-        if (act == null) {
-            return false;
-        }
-        return act.getClass().getName().contains("DetailActivity");
-    }
-
-    /**
-     * 清屏状态变化后全量重算：遍历已跟踪的 View 重新走 fit()
-     * （进入清屏 → 图片开始收缩；退出清屏回详情 → 面板门控自动还原）。
+     * 全量重算：清屏状态变化 / Activity resume 时遍历已跟踪的 View 重新走 fit()
+     * （返回 Feed 后 getAweme 不再触发、layout 无变化时的死区靠它兜底）。
      * 非主线程自动切主线程。
      */
     static void refitAll() {
@@ -842,10 +617,9 @@ final class FitApplier {
         }
     }
 
-    /** 撤销该 View 上本模块的全部适配（LayoutParams 与 scaleType 各自幂等还原）。 */
+    /** 撤销该 View 上本模块的适配（幂等还原原始 LayoutParams）。 */
     private static void undo(View video) {
         restoreLayoutParams(video);
-        restoreScale(video);
     }
 
     // ------------------------------------------------------ 容器尺寸监听
@@ -884,10 +658,7 @@ final class FitApplier {
                     return;
                 }
                 FitState state = STATES.get(target);
-                if (state == null) {
-                    return;
-                }
-                if (!state.draweeFit && state.aspect <= 0.05f) {
+                if (state == null || state.aspect <= 0.05f) {
                     return;
                 }
                 fit(target, v, state);
@@ -922,7 +693,7 @@ final class FitApplier {
         }
     }
 
-    /** 还原 LayoutParams（仅当当前值仍是我们写入的原始记录语义下才覆盖）。 */
+    /** 还原 LayoutParams（仅当当前值仍是我们写入的值才覆盖）。 */
     private static void restoreLayoutParams(View video) {
         int[] rec = ORIGINALS.remove(video);
         if (rec == null) {
@@ -942,16 +713,5 @@ final class FitApplier {
             Log.d(TAG, "restore " + rec[0] + "x" + rec[1]);
         }
         // 当前尺寸不等于本模块上次写入值 → 抖音已自行改写，只清记录不覆盖
-    }
-
-    private static void log(String msg) {
-        Log.d(TAG, msg);
-    }
-
-    private static void logOnce(String msg) {
-        if (!scaleReflectLogged) {
-            scaleReflectLogged = true;
-            Log.e(TAG, msg);
-        }
     }
 }
