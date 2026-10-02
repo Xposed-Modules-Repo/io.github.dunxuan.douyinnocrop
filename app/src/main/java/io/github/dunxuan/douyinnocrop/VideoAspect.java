@@ -48,28 +48,7 @@ final class VideoAspect {
         return 0f;
     }
 
-    /** 该 Aweme 是否为图文/动图帖子（imageInfos 或 images 非空）。 */
-    static boolean isImagePost(Object aweme) {
-        if (aweme == null) {
-            return false;
-        }
-        try {
-            Object infos = aweme.getClass().getField("imageInfos").get(aweme);
-            if (infos instanceof List && !((List<?>) infos).isEmpty()) {
-                return true;
-            }
-        } catch (Throwable ignored) {
-            // 字段不可达，继续试 images
-        }
-        try {
-            Object imgs = aweme.getClass().getField("images").get(aweme);
-            return imgs instanceof List && !((List<?>) imgs).isEmpty();
-        } catch (Throwable ignored) {
-            return false;
-        }
-    }
-
-    /** 该 Aweme 的帖子 id（用于识别 View 复用到了新内容，防止真实尺寸残留）。 */
+    /** 该 Aweme 的帖子 id（用于日志与 View 复用识别）。 */
     static String aid(Object aweme) {
         if (aweme == null) {
             return null;
