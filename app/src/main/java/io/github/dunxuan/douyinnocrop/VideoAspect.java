@@ -102,8 +102,19 @@ final class VideoAspect {
 
     /** 图文/动图回退：Aweme.imageInfos 第一项的 width/height（ImageInfo 为语义字段名）。 */
     private static float fromImageInfos(Object aweme) {
+        // 1) imageInfos（ImageInfo.width/height）
+        float r = listDims(aweme, "imageInfos");
+        if (isSane(r)) {
+            return r;
+        }
+        // 2) images（有的帖只填 images 不填 imageInfos——aspect=0 的来源）
+        return listDims(aweme, "images");
+    }
+
+    /** 读 aweme.<listField> 第一项的 width/height；读不到返回 0。 */
+    private static float listDims(Object aweme, String listField) {
         try {
-            Object infos = aweme.getClass().getField("imageInfos").get(aweme);
+            Object infos = aweme.getClass().getField(listField).get(aweme);
             if (!(infos instanceof List)) {
                 return 0f;
             }
